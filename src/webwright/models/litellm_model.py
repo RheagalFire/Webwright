@@ -1,11 +1,8 @@
-"""LiteLLM chat completions model backend.
+"""LiteLLM model backend using the litellm Python SDK.
 
-Routes requests through a LiteLLM proxy (https://github.com/BerriAI/litellm),
-which provides a unified OpenAI-compatible endpoint for 100+ LLM providers
-(Anthropic, Bedrock, Vertex, Gemini, Cohere, Mistral, etc.).
-
-Reuses the same Chat Completions wire format as the OpenRouter backend since
-the LiteLLM proxy speaks the OpenAI Chat Completions API natively.
+Uses litellm.acompletion() directly to access 100+ LLM providers
+(Anthropic, Bedrock, Vertex, Gemini, Cohere, Mistral, etc.) without
+needing a separate proxy server.
 """
 
 from __future__ import annotations
@@ -122,7 +119,6 @@ def _usage_metrics_from_chat_completions(payload: dict[str, Any]) -> dict[str, i
 class LiteLLMModelConfig(BaseModelConfig):
     model_name: OptStr = "gpt-4o"
     litellm_api_key: OptStr = ""
-    litellm_endpoint: OptStr = "http://localhost:4000/chat/completions"
 
 
 class LiteLLMModel(BaseModel):
@@ -133,21 +129,28 @@ class LiteLLMModel(BaseModel):
     _MAX_TRANSIENT_RETRIES = 5
     _DEFAULT_CONFIG_CLASS = LiteLLMModelConfig
 
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        try:
+            import litellm
+            self._litellm = litellm
+        except ImportError as exc:
+            raise RuntimeError(
+                "litellm package is required. Install with: pip install litellm"
+            ) from exc
+
     def _request_headers(self) -> dict[str, str]:
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        if self.config.litellm_api_key:
-            headers["Authorization"] = f"Bearer {self.config.litellm_api_key}"
-        return headers
+        return {}
 
     def _post_url(self) -> str:
-        return self.config.litellm_endpoint
+        return ""
 
     def _build_payload(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+        return {
             "model": self.config.model_name,
             "messages": _serialize_chat_messages(messages),
-            "stream": False,
             "max_tokens": self.config.max_output_tokens,
+            "drop_params": True,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -157,14 +160,13 @@ class LiteLLMModel(BaseModel):
                 },
             },
         }
-        return payload
 
     def _build_text_payload(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         return {
             "model": self.config.model_name,
             "messages": _serialize_chat_messages(messages),
-            "stream": False,
             "max_tokens": self.config.max_output_tokens,
+            "drop_params": True,
         }
 
     def _request_metrics_input(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -175,3 +177,36 @@ class LiteLLMModel(BaseModel):
 
     def _usage_metrics_from_payload(self, payload: dict[str, Any]) -> dict[str, int]:
         return _usage_metrics_from_chat_completions(payload)
+
+    async def _post_with_retries(self, payload: dict[str, Any]) -> dict[str, Any]:
+        model = payload.pop("model")
+        messages = payload.pop("messages")
+
+        kwargs: dict[str, Any] = {**payload}
+        if self.config.litellm_api_key:
+            kwargs["api_key"] = self.config.litellm_api_key
+
+        for attempt in range(max(self._MAX_RATE_LIMIT_RETRIES, self._MAX_TRANSIENT_RETRIES) + 1):
+            try:
+                response = await self._litellm.acompletion(
+                    model=model, messages=messages, **kwargs
+                )
+                return response.model_dump()
+            except Exception as exc:
+                from webwright.models.base import _is_rate_limit_error, _is_transient_http_error
+
+                if _is_rate_limit_error(exc):
+                    self._log_gateway_error(event="rate_limit_error", attempt=attempt + 1, error=exc)
+                    if attempt >= self._MAX_RATE_LIMIT_RETRIES:
+                        raise
+                    await self._rate_limit_backoff(attempt, exc)
+                    continue
+                if _is_transient_http_error(exc):
+                    self._log_gateway_error(event="transient_http_error", attempt=attempt + 1, error=exc)
+                    if attempt >= self._MAX_TRANSIENT_RETRIES:
+                        raise
+                    await self._transient_backoff(attempt, exc)
+                    continue
+                self._log_gateway_error(event="fatal_gateway_error", attempt=attempt + 1, error=exc)
+                raise
+        raise RuntimeError("Exceeded retry budget without exception or success.")
